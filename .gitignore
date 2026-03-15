@@ -1,0 +1,32 @@
+# Secrets
+.env
+
+# macOS
+.DS_Store
+
+# Codex & Python runtime
+.codex/
+.venv/
+
+# Generated / transient
+text_versions/
+failure
+watch.log
+watch.err
+
+# Input files (sensitive, not for versioning)
+*.pdf
+*.txt
+*.doc
+*.docx
+
+# Image files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.heic
+*.tiff
+*.tif
+*.bmp
