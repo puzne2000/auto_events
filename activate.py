@@ -125,6 +125,25 @@ def _choose_attendees_to_keep(attendees: list[tuple[str, str]]) -> list[str]:
     return result if result else labels
 
 
+def _choose_attendees_safe(attendees: list[tuple[str, str]]) -> list[str]:
+    """Run the tkinter dialog in a subprocess so a GUI crash (SIGABRT) can't kill the parent."""
+    import multiprocessing as mp
+
+    def _worker(attendees: list[tuple[str, str]], q: "mp.Queue[list[str]]") -> None:
+        try:
+            q.put(_choose_attendees_to_keep(attendees))
+        except Exception:
+            q.put([a[0] for a in attendees])
+
+    q: "mp.Queue[list[str]]" = mp.Queue()
+    p = mp.Process(target=_worker, args=(attendees, q))
+    p.start()
+    p.join()
+    if p.exitcode != 0 or q.empty():
+        return [a[0] for a in attendees]
+    return q.get()
+
+
 def _filter_ics_attendees(
     ics_text: str,
     keep_labels: list[str],
@@ -205,7 +224,7 @@ def main() -> int:
         pass
 
     codex_bin = os.environ.get("CODEX_BIN", "codex")
-    codex_flags = os.environ.get("CODEX_FLAGS", "--full-auto --skip-git-repo-check").strip()
+    codex_flags = os.environ.get("CODEX_FLAGS", "--sandbox workspace-write --skip-git-repo-check").strip()
     codex_args = [codex_bin, "exec"] + (shlex.split(codex_flags) if codex_flags else [])
 
     env = os.environ.copy()
@@ -254,9 +273,9 @@ def main() -> int:
         failure_path.write_text("\n".join(details), encoding="utf-8")
         return result.returncode if result.returncode != 0 else 3
 
-    failure_path = script_dir / "failure.failure.txt"
-    if failure_path.exists():
-        failure_path.unlink()
+    for failure_path in (script_dir / "failure", script_dir / "failure.failure.txt"):
+        if failure_path.exists():
+            failure_path.unlink()
     print(f"Created {output_path.name}")
 
     # Let the user review and trim attendees before opening.
@@ -264,12 +283,12 @@ def main() -> int:
         ics_text = output_path.read_text(encoding="utf-8")
         attendees = _parse_ics_attendees(ics_text)
         if len(attendees) > 1:
-            keep = _choose_attendees_to_keep(attendees)
+            keep = _choose_attendees_safe(attendees)
         else:
             keep = [a[0] for a in attendees]  # keep all, no dialog
-            filtered = _filter_ics_attendees(ics_text, keep, attendees)
-            if filtered != ics_text:
-                output_path.write_text(filtered, encoding="utf-8")
+        filtered = _filter_ics_attendees(ics_text, keep, attendees)
+        if filtered != ics_text:
+            output_path.write_text(filtered, encoding="utf-8")
     except Exception:
         pass  # best-effort; don't block opening the file
 
