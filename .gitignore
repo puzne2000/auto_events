@@ -7,12 +7,15 @@
 # Codex & Python runtime
 .codex/
 .venv/
+__pycache__/
+*.py[cod]
 
 # Generated / transient
 text_versions/
 failure
 watch.log
 watch.err
+*.ics
 
 # Input files (sensitive, not for versioning)
 *.pdf
