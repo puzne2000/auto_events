@@ -178,6 +178,103 @@ def _filter_ics_attendees(
     return "".join(result)
 
 
+def _text_quality_score(text: str) -> int:
+    stripped = text.strip()
+    if len(stripped) < 80:
+        return 0
+
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    single_char_lines = sum(1 for line in lines if len(line) <= 2)
+    emails = len(re.findall(r"[\w.+-]+@[\w.-]+\.\w+", stripped))
+    times = len(re.findall(r"\b\d{1,2}:\d{2}\b", stripped))
+    dates = len(re.findall(r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)", stripped, re.I))
+    wordish = len(re.findall(r"[A-Za-z0-9\u0590-\u05FF]{2,}", stripped))
+    hebrew_chars = len(re.findall(r"[\u0590-\u05FF]", stripped))
+
+    score = len(stripped) + (wordish * 12) + (emails * 180) + (times * 80) + (dates * 80)
+    score += min(hebrew_chars, 300)
+    score -= single_char_lines * 35
+    if len(stripped) < 300:
+        score -= 250
+    return max(score, 0)
+
+
+def _run_text_extractor(script_dir: Path, script_name: str, input_path: Path) -> tuple[str, str]:
+    script_path = script_dir / "scripts" / script_name
+    result = subprocess.run(
+        [sys.executable, str(script_path), str(input_path)],
+        cwd=str(script_dir),
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        return "", (result.stderr or result.stdout or "").strip()
+    return result.stdout or "", ""
+
+
+def _prepare_pdf_text(input_path: Path, script_dir: Path) -> Path | None:
+    if input_path.suffix.lower() != ".pdf":
+        return None
+
+    text_dir = script_dir / "text_versions"
+    text_dir.mkdir(exist_ok=True)
+    output_path = text_dir / f"{input_path.stem}_extracted.txt"
+    ocr_candidate_path = text_dir / f"{input_path.stem}_ocr_candidate.txt"
+
+    attempts: list[tuple[str, str, int, str]] = []
+    for label, script_name in (
+        ("pymupdf", "extract_pdf_text_fitz.py"),
+        ("pdf-stream-heuristic", "extract_pdf_text.py"),
+    ):
+        text, error = _run_text_extractor(script_dir, script_name, input_path)
+        attempts.append((label, text, _text_quality_score(text), error))
+
+    best_score = max((attempt[2] for attempt in attempts), default=0)
+    best_chars = max((len(attempt[1].strip()) for attempt in attempts), default=0)
+    if best_score < 1800 or best_chars < 500:
+        try:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(script_dir / "scripts" / "ocr_pdf_text.py"),
+                    str(input_path),
+                    "-o",
+                    str(ocr_candidate_path),
+                    "--lang",
+                    "heb+eng",
+                ],
+                cwd=str(script_dir),
+                text=True,
+                capture_output=True,
+            )
+            if result.returncode == 0 and ocr_candidate_path.is_file():
+                text = ocr_candidate_path.read_text(encoding="utf-8", errors="replace")
+                attempts.append(("ocr", text, _text_quality_score(text), ""))
+            else:
+                attempts.append(("ocr", "", 0, (result.stderr or result.stdout or "").strip()))
+        except Exception as exc:
+            attempts.append(("ocr", "", 0, str(exc)))
+
+    selected = max(attempts, key=lambda attempt: attempt[2], default=("none", "", 0, ""))
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    report = [
+        f"source_file: {input_path.name}",
+        f"timestamp_utc: {timestamp}",
+        f"selected_method: {selected[0]}",
+        f"selected_score: {selected[2]}",
+        "attempts:",
+    ]
+    for label, text, score, error in attempts:
+        detail = f"- {label}: score={score}, chars={len(text.strip())}"
+        if error:
+            detail += f", error={error}"
+        report.append(detail)
+
+    report.extend(["", "selected_text:", selected[1].strip(), ""])
+    output_path.write_text("\n".join(report), encoding="utf-8")
+    return output_path
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         _die("Usage: activate.py <input-file>", 2)
@@ -237,13 +334,21 @@ def main() -> int:
     Path(codex_home).mkdir(parents=True, exist_ok=True)
 
     output_path = input_path.with_suffix(".ics")
+    extracted_text_path = _prepare_pdf_text(input_path, script_dir)
+    extraction_instruction = ""
+    if extracted_text_path:
+        extraction_instruction = (
+            f" A pre-extracted text version is available at {extracted_text_path.relative_to(script_dir)}. "
+            "Use it as the primary text source, especially if direct PDF reading is garbled. "
+            "It includes extraction method and quality metadata."
+        )
 
     prompt = (
         f"Generate an iCalendar (.ics) file from {input_path.name} and save it as "
         f"{output_path.name} in the same folder. Use valid RFC 5545 format. "
         f"Set METHOD:REQUEST so the event is an invitation. "
         f"Overwrite {output_path.name} if it already exists. Do not ask questions."
-        f" Use AGENTS.md for instructions."
+        f"{extraction_instruction} Use AGENTS.md for instructions."
     )
 
     result = subprocess.run(
