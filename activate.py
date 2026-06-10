@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import os
 import re
 import shlex
@@ -7,6 +8,17 @@ import shutil
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+IMAGE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".heic",
+    ".tiff",
+    ".bmp",
+}
 
 
 def _die(message: str, code: int = 1) -> None:
@@ -212,6 +224,98 @@ def _run_text_extractor(script_dir: Path, script_name: str, input_path: Path) ->
     return result.stdout or "", ""
 
 
+def _run_tesseract(image_path: Path, output_base: Path) -> tuple[str, str]:
+    tesseract = Path("/opt/homebrew/bin/tesseract")
+    if not tesseract.is_file():
+        return "", f"tesseract not found at {tesseract}"
+
+    output_txt = output_base.with_suffix(".txt")
+    result = subprocess.run(
+        [
+            str(tesseract),
+            str(image_path),
+            str(output_base),
+            "-l",
+            "heb+eng",
+            "--psm",
+            "6",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0 or not output_txt.is_file():
+        return "", (result.stderr or result.stdout or "").strip()
+    return output_txt.read_text(encoding="utf-8", errors="replace"), ""
+
+
+def _convert_image_to_png(input_path: Path, output_path: Path) -> str:
+    sips = shutil.which("sips")
+    if not sips:
+        return "sips not found"
+
+    result = subprocess.run(
+        [sips, "-s", "format", "png", str(input_path), "--out", str(output_path)],
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0 or not output_path.is_file():
+        return (result.stderr or result.stdout or "").strip()
+    return ""
+
+
+def _prepare_image_text(input_path: Path, script_dir: Path) -> Path | None:
+    if input_path.suffix.lower() not in IMAGE_EXTENSIONS:
+        return None
+
+    text_dir = script_dir / "text_versions"
+    text_dir.mkdir(exist_ok=True)
+    output_path = text_dir / f"{input_path.stem}_image_extracted.txt"
+
+    attempts: list[tuple[str, str, int, str]] = []
+    direct_text, direct_error = _run_tesseract(input_path, text_dir / f"{input_path.stem}_image_direct")
+    attempts.append(("tesseract", direct_text, _text_quality_score(direct_text), direct_error))
+
+    best_score = max((attempt[2] for attempt in attempts), default=0)
+    best_chars = max((len(attempt[1].strip()) for attempt in attempts), default=0)
+    if best_score < 1800 or best_chars < 120:
+        converted_path = text_dir / f"{input_path.stem}_ocr_input.png"
+        convert_error = _convert_image_to_png(input_path, converted_path)
+        if convert_error:
+            attempts.append(("sips-convert+tesseract", "", 0, convert_error))
+        else:
+            converted_text, converted_error = _run_tesseract(
+                converted_path,
+                text_dir / f"{input_path.stem}_image_converted",
+            )
+            attempts.append(
+                (
+                    "sips-convert+tesseract",
+                    converted_text,
+                    _text_quality_score(converted_text),
+                    converted_error,
+                )
+            )
+
+    selected = max(attempts, key=lambda attempt: attempt[2], default=("none", "", 0, ""))
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    report = [
+        f"source_file: {input_path.name}",
+        f"timestamp_utc: {timestamp}",
+        f"selected_method: {selected[0]}",
+        f"selected_score: {selected[2]}",
+        "attempts:",
+    ]
+    for label, text, score, error in attempts:
+        detail = f"- {label}: score={score}, chars={len(text.strip())}"
+        if error:
+            detail += f", error={error}"
+        report.append(detail)
+
+    report.extend(["", "selected_text:", selected[1].strip(), ""])
+    output_path.write_text("\n".join(report), encoding="utf-8")
+    return output_path
+
+
 def _prepare_pdf_text(input_path: Path, script_dir: Path) -> Path | None:
     if input_path.suffix.lower() != ".pdf":
         return None
@@ -275,6 +379,37 @@ def _prepare_pdf_text(input_path: Path, script_dir: Path) -> Path | None:
     return output_path
 
 
+def _prepare_extracted_text(input_path: Path, script_dir: Path) -> Path | None:
+    return _prepare_pdf_text(input_path, script_dir) or _prepare_image_text(input_path, script_dir)
+
+
+def _write_failure(
+    script_dir: Path,
+    input_path: Path,
+    output_path: Path,
+    codex_args: list[str],
+    return_code: int,
+    stdout: str = "",
+    stderr: str = "",
+) -> None:
+    # Use a suffixless file so watch.sh won't pick it up as another input.
+    failure_path = script_dir / "failure"
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    details = [
+        f"timestamp_utc: {timestamp}",
+        f"input_file: {input_path.name}",
+        f"expected_output: {output_path.name}",
+        f"command: {' '.join(codex_args)}",
+        f"return_code: {return_code}",
+        "stdout:",
+        stdout.strip(),
+        "stderr:",
+        stderr.strip(),
+        "",
+    ]
+    failure_path.write_text("\n".join(details), encoding="utf-8")
+
+
 def main() -> int:
     if len(sys.argv) != 2:
         _die("Usage: activate.py <input-file>", 2)
@@ -320,13 +455,12 @@ def main() -> int:
     except Exception:
         pass
 
-    codex_bin = os.environ.get("CODEX_BIN", "codex")
-    codex_flags = os.environ.get("CODEX_FLAGS", "--sandbox workspace-write --skip-git-repo-check").strip()
-    codex_args = [codex_bin, "exec"] + (shlex.split(codex_flags) if codex_flags else [])
-
     env = os.environ.copy()
     _load_dotenv(env, script_dir / ".env")
     _load_dotenv(env, Path.cwd() / ".env")
+    codex_bin = env.get("CODEX_BIN", "codex")
+    codex_flags = env.get("CODEX_FLAGS", "--sandbox workspace-write --skip-git-repo-check").strip()
+    codex_args = [codex_bin, "exec"] + (shlex.split(codex_flags) if codex_flags else [])
     codex_home = env.get("CODEX_HOME")
     if not codex_home:
         codex_home = str(script_dir / ".codex")
@@ -334,12 +468,12 @@ def main() -> int:
     Path(codex_home).mkdir(parents=True, exist_ok=True)
 
     output_path = input_path.with_suffix(".ics")
-    extracted_text_path = _prepare_pdf_text(input_path, script_dir)
+    extracted_text_path = _prepare_extracted_text(input_path, script_dir)
     extraction_instruction = ""
     if extracted_text_path:
         extraction_instruction = (
             f" A pre-extracted text version is available at {extracted_text_path.relative_to(script_dir)}. "
-            "Use it as the primary text source, especially if direct PDF reading is garbled. "
+            "Use it as the primary text source, especially if direct file reading is garbled. "
             "It includes extraction method and quality metadata."
         )
 
@@ -351,31 +485,47 @@ def main() -> int:
         f"{extraction_instruction} Use AGENTS.md for instructions."
     )
 
-    result = subprocess.run(
-        codex_args + [prompt],
-        cwd=str(script_dir),
-        env=env,
-        text=True,
-        capture_output=True,
-    )
+    codex_path = shutil.which(codex_bin, path=env.get("PATH")) if not Path(codex_bin).is_absolute() else codex_bin
+    if not codex_path or not Path(codex_path).is_file() or not os.access(codex_path, os.X_OK):
+        _write_failure(
+            script_dir,
+            input_path,
+            output_path,
+            codex_args,
+            127,
+            stderr=f"Codex binary not found or not executable: {codex_bin}",
+        )
+        return 127
+
+    try:
+        result = subprocess.run(
+            codex_args + [prompt],
+            cwd=str(script_dir),
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+    except FileNotFoundError as exc:
+        _write_failure(
+            script_dir,
+            input_path,
+            output_path,
+            codex_args,
+            127,
+            stderr=str(exc),
+        )
+        return 127
 
     if not output_path.is_file():
-        # Use a suffix that won't be picked up by watch.sh's extensions filter.
-        failure_path = script_dir / "failure"
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        details = [
-            f"timestamp_utc: {timestamp}",
-            f"input_file: {input_path.name}",
-            f"expected_output: {output_path.name}",
-            f"command: {' '.join(codex_args)}",
-            f"return_code: {result.returncode}",
-            "stdout:",
-            (result.stdout or "").strip(),
-            "stderr:",
-            (result.stderr or "").strip(),
-            "",
-        ]
-        failure_path.write_text("\n".join(details), encoding="utf-8")
+        _write_failure(
+            script_dir,
+            input_path,
+            output_path,
+            codex_args,
+            result.returncode,
+            result.stdout or "",
+            result.stderr or "",
+        )
         return result.returncode if result.returncode != 0 else 3
 
     for failure_path in (script_dir / "failure", script_dir / "failure.failure.txt"):

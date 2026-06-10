@@ -4,7 +4,7 @@ set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
 WATCH_DIR="/Users/guykindler/My Drive/python stuff/watch_folder"
-PY="/usr/bin/python3"
+PY="/opt/homebrew/bin/python3"
 SCRIPT="$WATCH_DIR/activate.py"
 
 # Watch for new files and run activate.py once per created file.
@@ -23,6 +23,6 @@ fswatch -0 -e ".*" -i ".*" --event Created --event Updated --event Renamed "$WAT
       *) continue ;;
     esac
     sleep 1
-    "$PY" "$SCRIPT" "$path"
+    "$PY" "$SCRIPT" "$path" || true
   fi
 done
