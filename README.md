@@ -119,6 +119,8 @@ Drop any supported file into the folder. The `.ics` appears next to the original
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `APP_PYTHON` | `/opt/homebrew/opt/python@3.11/bin/python3.11` | Python used to run `activate.py`; must support Tkinter for attendee review |
+| `EXTRACTOR_PYTHON` | same as `APP_PYTHON` | Python used by PDF/OCR extraction helper scripts |
 | `OPENAI_API_KEY` | — | Required for Codex |
 | `CODEX_BIN` | `codex` | Path to the Codex binary |
 | `CODEX_FLAGS` | `--full-auto --skip-git-repo-check` | Flags passed to `codex exec` |

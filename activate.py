@@ -6,6 +6,7 @@ import shlex
 import subprocess
 import shutil
 import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -117,14 +118,16 @@ def _choose_attendees_to_keep(attendees: list[tuple[str, str]]) -> list[str]:
     listbox.bind("<space>", toggle)
     listbox.focus_set()
 
-    result: list[str] = []
+    result: list[str] | None = None
 
     def on_ok(event=None):
-        result.extend(labels[i] for i, k in enumerate(kept) if k)
+        nonlocal result
+        result = [labels[i] for i, k in enumerate(kept) if k]
         root.destroy()
 
     def on_cancel(event=None):
-        result.extend(labels)
+        nonlocal result
+        result = labels
         root.destroy()
 
     btn = tk.Frame(root)
@@ -133,27 +136,43 @@ def _choose_attendees_to_keep(attendees: list[tuple[str, str]]) -> list[str]:
     tk.Button(btn, text="Cancel", width=10, command=on_cancel).pack(side=tk.LEFT, padx=5)
     root.bind("<Return>", on_ok)
     root.bind("<Escape>", on_cancel)
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    root.lift()
+    root.focus_force()
+    root.update_idletasks()
+    root.update()
+    if not root.winfo_viewable():
+        root.destroy()
+        raise RuntimeError("Attendee review dialog was created but is not visible")
     root.mainloop()
-    return result if result else labels
+    if result is None:
+        raise RuntimeError("Attendee review dialog closed without OK or Cancel")
+    return result
+
+
+def _choose_attendees_worker(attendees: list[tuple[str, str]], q: object) -> None:
+    try:
+        q.put(("ok", _choose_attendees_to_keep(attendees)))
+    except Exception:
+        q.put(("error", traceback.format_exc()))
 
 
 def _choose_attendees_safe(attendees: list[tuple[str, str]]) -> list[str]:
     """Run the tkinter dialog in a subprocess so a GUI crash (SIGABRT) can't kill the parent."""
     import multiprocessing as mp
 
-    def _worker(attendees: list[tuple[str, str]], q: "mp.Queue[list[str]]") -> None:
-        try:
-            q.put(_choose_attendees_to_keep(attendees))
-        except Exception:
-            q.put([a[0] for a in attendees])
-
-    q: "mp.Queue[list[str]]" = mp.Queue()
-    p = mp.Process(target=_worker, args=(attendees, q))
+    q: "mp.Queue[tuple[str, object]]" = mp.Queue()
+    p = mp.Process(target=_choose_attendees_worker, args=(attendees, q))
     p.start()
     p.join()
-    if p.exitcode != 0 or q.empty():
-        return [a[0] for a in attendees]
-    return q.get()
+    if p.exitcode != 0:
+        raise RuntimeError(f"Attendee review dialog exited with code {p.exitcode}")
+    if q.empty():
+        raise RuntimeError("Attendee review dialog exited without returning a selection")
+    status, payload = q.get()
+    if status == "error":
+        raise RuntimeError(f"Attendee review dialog failed:\n{payload}")
+    return payload
 
 
 def _filter_ics_attendees(
@@ -211,10 +230,15 @@ def _text_quality_score(text: str) -> int:
     return max(score, 0)
 
 
-def _run_text_extractor(script_dir: Path, script_name: str, input_path: Path) -> tuple[str, str]:
+def _run_text_extractor(
+    script_dir: Path,
+    script_name: str,
+    input_path: Path,
+    python_executable: str,
+) -> tuple[str, str]:
     script_path = script_dir / "scripts" / script_name
     result = subprocess.run(
-        [sys.executable, str(script_path), str(input_path)],
+        [python_executable, str(script_path), str(input_path)],
         cwd=str(script_dir),
         text=True,
         capture_output=True,
@@ -316,7 +340,7 @@ def _prepare_image_text(input_path: Path, script_dir: Path) -> Path | None:
     return output_path
 
 
-def _prepare_pdf_text(input_path: Path, script_dir: Path) -> Path | None:
+def _prepare_pdf_text(input_path: Path, script_dir: Path, python_executable: str) -> Path | None:
     if input_path.suffix.lower() != ".pdf":
         return None
 
@@ -330,7 +354,7 @@ def _prepare_pdf_text(input_path: Path, script_dir: Path) -> Path | None:
         ("pymupdf", "extract_pdf_text_fitz.py"),
         ("pdf-stream-heuristic", "extract_pdf_text.py"),
     ):
-        text, error = _run_text_extractor(script_dir, script_name, input_path)
+        text, error = _run_text_extractor(script_dir, script_name, input_path, python_executable)
         attempts.append((label, text, _text_quality_score(text), error))
 
     best_score = max((attempt[2] for attempt in attempts), default=0)
@@ -339,7 +363,7 @@ def _prepare_pdf_text(input_path: Path, script_dir: Path) -> Path | None:
         try:
             result = subprocess.run(
                 [
-                    sys.executable,
+                    python_executable,
                     str(script_dir / "scripts" / "ocr_pdf_text.py"),
                     str(input_path),
                     "-o",
@@ -379,8 +403,8 @@ def _prepare_pdf_text(input_path: Path, script_dir: Path) -> Path | None:
     return output_path
 
 
-def _prepare_extracted_text(input_path: Path, script_dir: Path) -> Path | None:
-    return _prepare_pdf_text(input_path, script_dir) or _prepare_image_text(input_path, script_dir)
+def _prepare_extracted_text(input_path: Path, script_dir: Path, python_executable: str) -> Path | None:
+    return _prepare_pdf_text(input_path, script_dir, python_executable) or _prepare_image_text(input_path, script_dir)
 
 
 def _write_failure(
@@ -461,6 +485,7 @@ def main() -> int:
     codex_bin = env.get("CODEX_BIN", "codex")
     codex_flags = env.get("CODEX_FLAGS", "--sandbox workspace-write --skip-git-repo-check").strip()
     codex_args = [codex_bin, "exec"] + (shlex.split(codex_flags) if codex_flags else [])
+    extractor_python = env.get("EXTRACTOR_PYTHON", sys.executable)
     codex_home = env.get("CODEX_HOME")
     if not codex_home:
         codex_home = str(script_dir / ".codex")
@@ -468,7 +493,7 @@ def main() -> int:
     Path(codex_home).mkdir(parents=True, exist_ok=True)
 
     output_path = input_path.with_suffix(".ics")
-    extracted_text_path = _prepare_extracted_text(input_path, script_dir)
+    extracted_text_path = _prepare_extracted_text(input_path, script_dir, extractor_python)
     extraction_instruction = ""
     if extracted_text_path:
         extraction_instruction = (
@@ -544,8 +569,16 @@ def main() -> int:
         filtered = _filter_ics_attendees(ics_text, keep, attendees)
         if filtered != ics_text:
             output_path.write_text(filtered, encoding="utf-8")
-    except Exception:
-        pass  # best-effort; don't block opening the file
+    except Exception as exc:
+        _write_failure(
+            script_dir,
+            input_path,
+            output_path,
+            codex_args + ["<attendee-review>"],
+            4,
+            stderr=str(exc),
+        )
+        return 4
 
     try:
         subprocess.run(["open", str(output_path)], check=False)

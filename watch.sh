@@ -4,7 +4,15 @@ set -euo pipefail
 export PATH="/opt/homebrew/bin:$PATH"
 
 WATCH_DIR="/Users/guykindler/My Drive/python stuff/watch_folder"
-PY="/opt/homebrew/bin/python3"
+ENV_FILE="$WATCH_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+fi
+
+PY="${APP_PYTHON:-/opt/homebrew/opt/python@3.11/bin/python3.11}"
 SCRIPT="$WATCH_DIR/activate.py"
 
 # Watch for new files and run activate.py once per created file.
