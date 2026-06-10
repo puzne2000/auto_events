@@ -45,6 +45,7 @@ These files contain personal and academic records. Avoid copying sensitive data 
 ## Generating the ics files
 - If the input file is an email exchange, add all recepients to the event
 Use the following points in creating the file:
+- Always set the organizer to Guy Kindler using `guy.kindler@mail.huji.ac.il`; every other person, mailing list, speaker, sender, or host should be an attendee, not the organizer.
 - Unless stated otherwise, assume Jerusalem time
 - If the event is a meeting, add the location to the event if you can find it
 - use web search or any other means to find anything you need to get the best details possible about the event, including location

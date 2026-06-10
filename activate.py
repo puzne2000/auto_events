@@ -20,6 +20,9 @@ IMAGE_EXTENSIONS = {
     ".tiff",
     ".bmp",
 }
+ORGANIZER_CN = "Guy Kindler"
+ORGANIZER_EMAIL = "guy.kindler@mail.huji.ac.il"
+ORGANIZER_LINE = f"ORGANIZER;CN={ORGANIZER_CN}:mailto:{ORGANIZER_EMAIL}"
 
 
 def _die(message: str, code: int = 1) -> None:
@@ -64,6 +67,72 @@ def _parse_ics_attendees(ics_text: str) -> list[tuple[str, str]]:
             continue
         attendees.append((label, line))
     return attendees
+
+
+def _parse_ics_person(line: str) -> tuple[str, str] | None:
+    cn_match = re.search(r"CN=([^;:]+)", line, re.IGNORECASE)
+    email_match = re.search(r":mailto:(.+)$", line, re.IGNORECASE)
+    cn = cn_match.group(1).strip().strip('"') if cn_match else ""
+    email = email_match.group(1).strip() if email_match else ""
+    if not cn and not email:
+        return None
+    return cn, email
+
+
+def _attendee_line(cn: str, email: str) -> str:
+    if cn:
+        return f"ATTENDEE;CN={cn};ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{email}"
+    return f"ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{email}"
+
+
+def _force_guy_as_organizer(ics_text: str) -> str:
+    raw_lines = ics_text.splitlines()
+    logical_lines: list[str] = []
+    current = ""
+    for raw_line in raw_lines:
+        if raw_line.startswith((" ", "\t")):
+            current += raw_line[1:]
+        else:
+            if current:
+                logical_lines.append(current)
+            current = raw_line
+    if current:
+        logical_lines.append(current)
+
+    organizer_people: list[tuple[str, str]] = []
+    attendee_emails = set()
+    output_lines: list[str] = []
+    inserted_organizer = False
+
+    for line in logical_lines:
+        if re.match(r"ORGANIZER[;:]", line, re.IGNORECASE):
+            person = _parse_ics_person(line)
+            if person and person[1].lower() != ORGANIZER_EMAIL:
+                organizer_people.append(person)
+            if not inserted_organizer:
+                output_lines.append(ORGANIZER_LINE)
+                inserted_organizer = True
+            continue
+
+        if re.match(r"ATTENDEE[;:]", line, re.IGNORECASE):
+            person = _parse_ics_person(line)
+            if person and person[1].lower() == ORGANIZER_EMAIL:
+                continue
+            if person:
+                attendee_emails.add(person[1].lower())
+
+        if line == "END:VEVENT" and not inserted_organizer:
+            output_lines.append(ORGANIZER_LINE)
+            inserted_organizer = True
+        output_lines.append(line)
+
+    for cn, email in organizer_people:
+        if email.lower() not in attendee_emails:
+            insert_at = next((i for i, line in enumerate(output_lines) if line == "END:VEVENT"), len(output_lines))
+            output_lines.insert(insert_at, _attendee_line(cn, email))
+            attendee_emails.add(email.lower())
+
+    return "\r\n".join(output_lines) + "\r\n"
 
 
 def _choose_attendees_to_keep(attendees: list[tuple[str, str]]) -> list[str]:
@@ -506,6 +575,7 @@ def main() -> int:
         f"Generate an iCalendar (.ics) file from {input_path.name} and save it as "
         f"{output_path.name} in the same folder. Use valid RFC 5545 format. "
         f"Set METHOD:REQUEST so the event is an invitation. "
+        f"Always set ORGANIZER to {ORGANIZER_EMAIL}; all other people or lists should be ATTENDEE entries. "
         f"Overwrite {output_path.name} if it already exists. Do not ask questions."
         f"{extraction_instruction} Use AGENTS.md for instructions."
     )
@@ -560,7 +630,8 @@ def main() -> int:
 
     # Let the user review and trim attendees before opening.
     try:
-        ics_text = output_path.read_text(encoding="utf-8")
+        ics_text = _force_guy_as_organizer(output_path.read_text(encoding="utf-8"))
+        output_path.write_text(ics_text, encoding="utf-8")
         attendees = _parse_ics_attendees(ics_text)
         if len(attendees) > 1:
             keep = _choose_attendees_safe(attendees)
