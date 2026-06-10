@@ -31,7 +31,7 @@ LaunchAgent       com.guykindler.activate-watch — keeps watch.sh running at lo
 - **macOS** — uses `fswatch`, LaunchAgents, and `open`
 - **fswatch**: `brew install fswatch`
 - **OpenAI `codex` CLI** with a valid API key
-- **Python 3** at `/usr/bin/python3` (system install) — tkinter is included, no extras required for basic use
+- **Python 3 with Tkinter** for `APP_PYTHON` — defaults to `/opt/homebrew/opt/python@3.11/bin/python3.11`
 - Optional: **`terminal-notifier`** (`brew install terminal-notifier`) for nicer macOS notifications
 - Optional: **`tesseract` + language data** (`brew install tesseract tesseract-lang`) for OCR on scanned PDFs and Hebrew PDFs with bad embedded text
 - Optional: **PyMuPDF** (`pip install pymupdf` inside `.venv`) for cleaner PDF text extraction
