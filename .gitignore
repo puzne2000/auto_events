@@ -6,6 +6,7 @@
 
 # Codex & Python runtime
 .codex/
+codex_state/
 .venv/
 __pycache__/
 *.py[cod]

@@ -23,6 +23,15 @@ IMAGE_EXTENSIONS = {
 ORGANIZER_CN = "Guy Kindler"
 ORGANIZER_EMAIL = "guy.kindler@mail.huji.ac.il"
 ORGANIZER_LINE = f"ORGANIZER;CN={ORGANIZER_CN}:mailto:{ORGANIZER_EMAIL}"
+CODEX_RUNTIME_ENV_PREFIXES = (
+    "CODEX_INTERNAL_",
+)
+CODEX_RUNTIME_ENV_KEYS = {
+    "CODEX_CI",
+    "CODEX_SANDBOX",
+    "CODEX_SHELL",
+    "CODEX_THREAD_ID",
+}
 
 
 def _die(message: str, code: int = 1) -> None:
@@ -44,6 +53,24 @@ def _load_dotenv(env: dict, dotenv_path: Path) -> None:
         value = value.strip().strip('"').strip("'")
         if key and key not in env:
             env[key] = value
+
+
+def _sanitize_codex_runtime_env(env: dict) -> None:
+    for key in list(env):
+        if key in CODEX_RUNTIME_ENV_KEYS or key.startswith(CODEX_RUNTIME_ENV_PREFIXES):
+            env.pop(key, None)
+
+
+def _seed_codex_home(codex_home: Path, legacy_home: Path) -> None:
+    codex_home.mkdir(parents=True, exist_ok=True)
+    if codex_home == legacy_home or not legacy_home.is_dir():
+        return
+
+    for filename in ("auth.json", "config.toml", "installation_id"):
+        source = legacy_home / filename
+        target = codex_home / filename
+        if source.is_file() and not target.exists():
+            shutil.copy2(source, target)
 
 
 def _parse_ics_attendees(ics_text: str) -> list[tuple[str, str]]:
@@ -549,6 +576,7 @@ def main() -> int:
         pass
 
     env = os.environ.copy()
+    _sanitize_codex_runtime_env(env)
     _load_dotenv(env, script_dir / ".env")
     _load_dotenv(env, Path.cwd() / ".env")
     codex_bin = env.get("CODEX_BIN", "codex")
@@ -557,9 +585,9 @@ def main() -> int:
     extractor_python = env.get("EXTRACTOR_PYTHON", sys.executable)
     codex_home = env.get("CODEX_HOME")
     if not codex_home:
-        codex_home = str(script_dir / ".codex")
+        codex_home = str(script_dir / "codex_state")
         env["CODEX_HOME"] = codex_home
-    Path(codex_home).mkdir(parents=True, exist_ok=True)
+    _seed_codex_home(Path(codex_home), script_dir / ".codex")
 
     output_path = input_path.with_suffix(".ics")
     extracted_text_path = _prepare_extracted_text(input_path, script_dir, extractor_python)
