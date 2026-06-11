@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import hashlib
+import json
 import os
 import re
-import shlex
 import subprocess
 import shutil
 import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib import error as urlerror
+from urllib import request
 
 IMAGE_EXTENSIONS = {
     ".jpg",
@@ -23,15 +26,8 @@ IMAGE_EXTENSIONS = {
 ORGANIZER_CN = "Guy Kindler"
 ORGANIZER_EMAIL = "guy.kindler@mail.huji.ac.il"
 ORGANIZER_LINE = f"ORGANIZER;CN={ORGANIZER_CN}:mailto:{ORGANIZER_EMAIL}"
-CODEX_RUNTIME_ENV_PREFIXES = (
-    "CODEX_INTERNAL_",
-)
-CODEX_RUNTIME_ENV_KEYS = {
-    "CODEX_CI",
-    "CODEX_SANDBOX",
-    "CODEX_SHELL",
-    "CODEX_THREAD_ID",
-}
+DEFAULT_OPENAI_MODEL = "gpt-5.5"
+DEFAULT_API_TIMEOUT_SECONDS = 120
 
 
 def _die(message: str, code: int = 1) -> None:
@@ -53,24 +49,6 @@ def _load_dotenv(env: dict, dotenv_path: Path) -> None:
         value = value.strip().strip('"').strip("'")
         if key and key not in env:
             env[key] = value
-
-
-def _sanitize_codex_runtime_env(env: dict) -> None:
-    for key in list(env):
-        if key in CODEX_RUNTIME_ENV_KEYS or key.startswith(CODEX_RUNTIME_ENV_PREFIXES):
-            env.pop(key, None)
-
-
-def _seed_codex_home(codex_home: Path, legacy_home: Path) -> None:
-    codex_home.mkdir(parents=True, exist_ok=True)
-    if codex_home == legacy_home or not legacy_home.is_dir():
-        return
-
-    for filename in ("auth.json", "config.toml", "installation_id"):
-        source = legacy_home / filename
-        target = codex_home / filename
-        if source.is_file() and not target.exists():
-            shutil.copy2(source, target)
 
 
 def _parse_ics_attendees(ics_text: str) -> list[tuple[str, str]]:
@@ -126,40 +104,55 @@ def _force_guy_as_organizer(ics_text: str) -> str:
     if current:
         logical_lines.append(current)
 
-    organizer_people: list[tuple[str, str]] = []
-    attendee_emails = set()
     output_lines: list[str] = []
-    inserted_organizer = False
+    in_event = False
+    event_has_organizer = False
+    organizer_people: list[tuple[str, str]] = []
+    attendee_emails: set[str] = set()
 
     for line in logical_lines:
-        if re.match(r"ORGANIZER[;:]", line, re.IGNORECASE):
-            person = _parse_ics_person(line)
-            if person and person[1].lower() != ORGANIZER_EMAIL:
-                organizer_people.append(person)
-            if not inserted_organizer:
-                output_lines.append(ORGANIZER_LINE)
-                inserted_organizer = True
+        if line == "BEGIN:VEVENT":
+            in_event = True
+            event_has_organizer = False
+            organizer_people = []
+            attendee_emails = set()
+            output_lines.append(line)
             continue
 
-        if re.match(r"ATTENDEE[;:]", line, re.IGNORECASE):
+        if re.match(r"ORGANIZER[;:]", line, re.IGNORECASE):
+            person = _parse_ics_person(line)
+            if in_event and person and person[1].lower() != ORGANIZER_EMAIL:
+                organizer_people.append(person)
+            if in_event and not event_has_organizer:
+                output_lines.append(ORGANIZER_LINE)
+                event_has_organizer = True
+            continue
+
+        if in_event and re.match(r"ATTENDEE[;:]", line, re.IGNORECASE):
             person = _parse_ics_person(line)
             if person and person[1].lower() == ORGANIZER_EMAIL:
                 continue
             if person:
                 attendee_emails.add(person[1].lower())
 
-        if line == "END:VEVENT" and not inserted_organizer:
-            output_lines.append(ORGANIZER_LINE)
-            inserted_organizer = True
+        if line == "END:VEVENT" and in_event:
+            if not event_has_organizer:
+                output_lines.append(ORGANIZER_LINE)
+                event_has_organizer = True
+            for cn, email in organizer_people:
+                if email.lower() not in attendee_emails:
+                    output_lines.append(_attendee_line(cn, email))
+                    attendee_emails.add(email.lower())
+            output_lines.append(line)
+            in_event = False
+            continue
+
         output_lines.append(line)
 
-    for cn, email in organizer_people:
-        if email.lower() not in attendee_emails:
-            insert_at = next((i for i, line in enumerate(output_lines) if line == "END:VEVENT"), len(output_lines))
-            output_lines.insert(insert_at, _attendee_line(cn, email))
-            attendee_emails.add(email.lower())
-
-    return "\r\n".join(output_lines) + "\r\n"
+    folded_lines: list[str] = []
+    for line in output_lines:
+        folded_lines.extend(_fold_ics_line(line))
+    return "\r\n".join(folded_lines) + "\r\n"
 
 
 def _choose_attendees_to_keep(attendees: list[tuple[str, str]]) -> list[str]:
@@ -499,15 +492,336 @@ def _prepare_pdf_text(input_path: Path, script_dir: Path, python_executable: str
     return output_path
 
 
+def _prepare_docx_text(input_path: Path, script_dir: Path, python_executable: str) -> Path | None:
+    if input_path.suffix.lower() != ".docx":
+        return None
+
+    text_dir = script_dir / "text_versions"
+    text_dir.mkdir(exist_ok=True)
+    output_path = text_dir / f"{input_path.stem}_extracted.txt"
+    text, error = _run_text_extractor(script_dir, "extract_docx_text.py", input_path, python_executable)
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    report = [
+        f"source_file: {input_path.name}",
+        f"timestamp_utc: {timestamp}",
+        "selected_method: docx",
+        f"selected_score: {_text_quality_score(text)}",
+        "attempts:",
+        f"- docx: score={_text_quality_score(text)}, chars={len(text.strip())}"
+        + (f", error={error}" if error else ""),
+        "",
+        "selected_text:",
+        text.strip(),
+        "",
+    ]
+    output_path.write_text("\n".join(report), encoding="utf-8")
+    return output_path
+
+
 def _prepare_extracted_text(input_path: Path, script_dir: Path, python_executable: str) -> Path | None:
-    return _prepare_pdf_text(input_path, script_dir, python_executable) or _prepare_image_text(input_path, script_dir)
+    return (
+        _prepare_pdf_text(input_path, script_dir, python_executable)
+        or _prepare_docx_text(input_path, script_dir, python_executable)
+        or _prepare_image_text(input_path, script_dir)
+    )
+
+
+def _selected_text_from_report(report: str) -> str:
+    marker = "\nselected_text:\n"
+    if marker not in report:
+        return report.strip()
+    return report.split(marker, 1)[1].strip()
+
+
+def _calendar_schema() -> dict:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "status": {"type": "string", "enum": ["ok", "error"]},
+            "error": {"type": "string"},
+            "events": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "description": {"type": "string"},
+                        "location": {"type": "string"},
+                        "start_utc": {
+                            "type": "string",
+                            "description": "UTC start in YYYYMMDDTHHMMSSZ format.",
+                        },
+                        "end_utc": {
+                            "type": "string",
+                            "description": "UTC end in YYYYMMDDTHHMMSSZ format.",
+                        },
+                        "attendees": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "name": {"type": "string"},
+                                    "email": {"type": "string"},
+                                },
+                                "required": ["name", "email"],
+                            },
+                        },
+                    },
+                    "required": [
+                        "summary",
+                        "description",
+                        "location",
+                        "start_utc",
+                        "end_utc",
+                        "attendees",
+                    ],
+                },
+            },
+        },
+        "required": ["status", "error", "events"],
+    }
+
+
+def _read_project_instructions(script_dir: Path) -> str:
+    agents_path = script_dir / "AGENTS.md"
+    if not agents_path.is_file():
+        return ""
+    return agents_path.read_text(encoding="utf-8", errors="replace")
+
+
+def _build_extraction_prompt(
+    input_path: Path,
+    extracted_text_path: Path | None,
+    source_text: str,
+    project_instructions: str,
+) -> str:
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    source_mtime = datetime.fromtimestamp(input_path.stat().st_mtime, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    text_source = str(extracted_text_path) if extracted_text_path else str(input_path)
+    return f"""
+Extract future calendar event data from this file and return JSON matching the supplied schema.
+
+Current time: {now_utc} UTC.
+Input file: {input_path.name}
+Input file modified time: {source_mtime} UTC.
+Text source: {text_source}
+
+Rules:
+- Return status "error" with a clear error and no events if the file does not contain a future event or if the date/time is ambiguous.
+- Compute relative dates from the file/email timestamp when present in the text; otherwise use the input file modified time.
+- Unless stated otherwise, assume Jerusalem time for meeting/event times.
+- For flights or travel itineraries that state "all times are local", use the local airport/city times and convert each leg to UTC.
+- Every event must be in the future relative to Current time.
+- Use {ORGANIZER_CN} <{ORGANIZER_EMAIL}> as organizer implicitly; do not include him as an attendee.
+- Include all other people, recipients, speakers, hosts, and mailing lists as attendees when an email address is available.
+- If a person's email is unknown, omit that attendee rather than inventing an address.
+- Keep summaries concise and locations useful.
+- Return UTC timestamps exactly as YYYYMMDDTHHMMSSZ.
+
+Project instructions:
+{project_instructions}
+
+Extracted text:
+{source_text}
+""".strip()
+
+
+def _extract_output_text(response_data: dict) -> str:
+    if isinstance(response_data.get("output_text"), str):
+        return response_data["output_text"]
+    pieces: list[str] = []
+    for item in response_data.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            if content.get("type") in {"output_text", "text"} and isinstance(content.get("text"), str):
+                pieces.append(content["text"])
+    return "\n".join(pieces).strip()
+
+
+def _call_openai_calendar_extractor(
+    env: dict,
+    prompt: str,
+) -> dict:
+    api_key = env.get("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set.")
+
+    model = env.get("ICS_OPENAI_MODEL") or env.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
+    timeout = int(env.get("ICS_OPENAI_TIMEOUT_SECONDS", DEFAULT_API_TIMEOUT_SECONDS))
+    effort = env.get("ICS_OPENAI_REASONING_EFFORT", "low")
+    payload: dict = {
+        "model": model,
+        "input": [{"role": "user", "content": prompt}],
+        "reasoning": {"effort": effort},
+        "max_output_tokens": int(env.get("ICS_OPENAI_MAX_OUTPUT_TOKENS", "12000")),
+        "store": False,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "calendar_events",
+                "strict": True,
+                "schema": _calendar_schema(),
+            },
+        },
+    }
+    if env.get("ICS_ENABLE_WEB_SEARCH", "").lower() in {"1", "true", "yes"}:
+        payload["tools"] = [{"type": "web_search_preview", "search_context_size": "medium"}]
+
+    body = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        "https://api.openai.com/v1/responses",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            response_data = json.loads(resp.read().decode("utf-8"))
+    except urlerror.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI API returned HTTP {exc.code}: {detail}") from exc
+    except urlerror.URLError as exc:
+        raise RuntimeError(f"OpenAI API request failed: {exc}") from exc
+
+    status = response_data.get("status")
+    if status not in {None, "completed"}:
+        raise RuntimeError(
+            f"OpenAI API response status was {status}: "
+            f"{json.dumps(response_data.get('error') or response_data.get('incomplete_details'))}"
+        )
+    output_text = _extract_output_text(response_data)
+    if not output_text:
+        raise RuntimeError("OpenAI API response did not include output text.")
+    try:
+        return json.loads(output_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"OpenAI API returned non-JSON output: {output_text[:1000]}") from exc
+
+
+def _parse_utc_stamp(value: str) -> datetime:
+    if not re.fullmatch(r"\d{8}T\d{6}Z", value):
+        raise ValueError(f"Invalid UTC timestamp: {value}")
+    return datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+
+
+def _ics_escape(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+    )
+
+
+def _fold_ics_line(line: str) -> list[str]:
+    encoded_len = 0
+    current = ""
+    lines: list[str] = []
+    limit = 75
+    for char in line:
+        char_len = len(char.encode("utf-8"))
+        if current and encoded_len + char_len > limit:
+            lines.append(current)
+            current = " " + char
+            encoded_len = 1 + char_len
+            limit = 75
+        else:
+            current += char
+            encoded_len += char_len
+    if current:
+        lines.append(current)
+    return lines
+
+
+def _append_ics_line(lines: list[str], line: str) -> None:
+    lines.extend(_fold_ics_line(line))
+
+
+def _build_ics(input_path: Path, extraction: dict) -> str:
+    if extraction.get("status") != "ok":
+        raise RuntimeError(extraction.get("error") or "Calendar extraction failed.")
+
+    events = extraction.get("events") or []
+    if not events:
+        raise RuntimeError("Calendar extraction returned no events.")
+
+    now = datetime.now(timezone.utc)
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//Guy Kindler Watch Folder//ICS Generator//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:REQUEST",
+    ]
+    dtstamp = now.strftime("%Y%m%dT%H%M%SZ")
+    uid_seed = hashlib.sha256(input_path.name.encode("utf-8")).hexdigest()[:12]
+
+    for index, event in enumerate(events, start=1):
+        summary = str(event.get("summary") or "").strip()
+        if not summary:
+            raise RuntimeError(f"Event {index} is missing a summary.")
+        start_utc = str(event.get("start_utc") or "")
+        end_utc = str(event.get("end_utc") or "")
+        start_dt = _parse_utc_stamp(start_utc)
+        end_dt = _parse_utc_stamp(end_utc)
+        if start_dt <= now:
+            raise RuntimeError(f"Event {index} starts in the past: {start_utc}")
+        if end_dt <= start_dt:
+            raise RuntimeError(f"Event {index} ends before it starts: {end_utc}")
+
+        lines.append("BEGIN:VEVENT")
+        _append_ics_line(lines, f"UID:{uid_seed}-{index}-{start_utc}@guy.kindler.mail.huji.ac.il")
+        _append_ics_line(lines, f"DTSTAMP:{dtstamp}")
+        _append_ics_line(lines, f"DTSTART:{start_utc}")
+        _append_ics_line(lines, f"DTEND:{end_utc}")
+        _append_ics_line(lines, f"SUMMARY:{_ics_escape(summary)}")
+        location = str(event.get("location") or "").strip()
+        if location:
+            _append_ics_line(lines, f"LOCATION:{_ics_escape(location)}")
+        description = str(event.get("description") or "").strip()
+        if description:
+            _append_ics_line(lines, f"DESCRIPTION:{_ics_escape(description)}")
+        _append_ics_line(lines, ORGANIZER_LINE)
+
+        seen_attendees = {ORGANIZER_EMAIL.lower()}
+        for attendee in event.get("attendees") or []:
+            email = str(attendee.get("email") or "").strip()
+            if not email or "@" not in email:
+                continue
+            email_key = email.lower()
+            if email_key in seen_attendees:
+                continue
+            seen_attendees.add(email_key)
+            name = str(attendee.get("name") or "").strip()
+            if name:
+                line = (
+                    f"ATTENDEE;CN={_ics_escape(name)};ROLE=REQ-PARTICIPANT;"
+                    f"PARTSTAT=NEEDS-ACTION;RSVP=TRUE:mailto:{email}"
+                )
+            else:
+                line = (
+                    "ATTENDEE;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;"
+                    f"RSVP=TRUE:mailto:{email}"
+                )
+            _append_ics_line(lines, line)
+        lines.append("END:VEVENT")
+
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines) + "\r\n"
 
 
 def _write_failure(
     script_dir: Path,
     input_path: Path,
     output_path: Path,
-    codex_args: list[str],
+    command_label: str,
     return_code: int,
     stdout: str = "",
     stderr: str = "",
@@ -519,7 +833,7 @@ def _write_failure(
         f"timestamp_utc: {timestamp}",
         f"input_file: {input_path.name}",
         f"expected_output: {output_path.name}",
-        f"command: {' '.join(codex_args)}",
+        f"command: {command_label}",
         f"return_code: {return_code}",
         "stdout:",
         stdout.strip(),
@@ -576,80 +890,37 @@ def main() -> int:
         pass
 
     env = os.environ.copy()
-    _sanitize_codex_runtime_env(env)
     _load_dotenv(env, script_dir / ".env")
     _load_dotenv(env, Path.cwd() / ".env")
-    codex_bin = env.get("CODEX_BIN", "codex")
-    codex_flags = env.get("CODEX_FLAGS", "--sandbox workspace-write --skip-git-repo-check").strip()
-    codex_args = [codex_bin, "exec"] + (shlex.split(codex_flags) if codex_flags else [])
     extractor_python = env.get("EXTRACTOR_PYTHON", sys.executable)
-    codex_home = env.get("CODEX_HOME")
-    if not codex_home:
-        codex_home = str(script_dir / "codex_state")
-        env["CODEX_HOME"] = codex_home
-    _seed_codex_home(Path(codex_home), script_dir / ".codex")
 
     output_path = input_path.with_suffix(".ics")
     extracted_text_path = _prepare_extracted_text(input_path, script_dir, extractor_python)
-    extraction_instruction = ""
     if extracted_text_path:
-        extraction_instruction = (
-            f" A pre-extracted text version is available at {extracted_text_path.relative_to(script_dir)}. "
-            "Use it as the primary text source, especially if direct file reading is garbled. "
-            "It includes extraction method and quality metadata."
-        )
-
-    prompt = (
-        f"Generate an iCalendar (.ics) file from {input_path.name} and save it as "
-        f"{output_path.name} in the same folder. Use valid RFC 5545 format. "
-        f"Set METHOD:REQUEST so the event is an invitation. "
-        f"Always set ORGANIZER to {ORGANIZER_EMAIL}; all other people or lists should be ATTENDEE entries. "
-        f"Overwrite {output_path.name} if it already exists. Do not ask questions."
-        f"{extraction_instruction} Use AGENTS.md for instructions."
-    )
-
-    codex_path = shutil.which(codex_bin, path=env.get("PATH")) if not Path(codex_bin).is_absolute() else codex_bin
-    if not codex_path or not Path(codex_path).is_file() or not os.access(codex_path, os.X_OK):
-        _write_failure(
-            script_dir,
-            input_path,
-            output_path,
-            codex_args,
-            127,
-            stderr=f"Codex binary not found or not executable: {codex_bin}",
-        )
-        return 127
+        source_report = extracted_text_path.read_text(encoding="utf-8", errors="replace")
+        source_text = _selected_text_from_report(source_report)
+    else:
+        source_text = input_path.read_text(encoding="utf-8", errors="replace")
 
     try:
-        result = subprocess.run(
-            codex_args + [prompt],
-            cwd=str(script_dir),
-            env=env,
-            text=True,
-            capture_output=True,
+        prompt = _build_extraction_prompt(
+            input_path,
+            extracted_text_path,
+            source_text,
+            _read_project_instructions(script_dir),
         )
-    except FileNotFoundError as exc:
+        extraction = _call_openai_calendar_extractor(env, prompt)
+        output_path.write_text(_build_ics(input_path, extraction), encoding="utf-8")
+    except Exception as exc:
         _write_failure(
             script_dir,
             input_path,
             output_path,
-            codex_args,
-            127,
+            "openai responses api",
+            3,
             stderr=str(exc),
         )
-        return 127
-
-    if not output_path.is_file():
-        _write_failure(
-            script_dir,
-            input_path,
-            output_path,
-            codex_args,
-            result.returncode,
-            result.stdout or "",
-            result.stderr or "",
-        )
-        return result.returncode if result.returncode != 0 else 3
+        return 3
 
     for failure_path in (script_dir / "failure", script_dir / "failure.failure.txt"):
         if failure_path.exists():
@@ -673,7 +944,7 @@ def main() -> int:
             script_dir,
             input_path,
             output_path,
-            codex_args + ["<attendee-review>"],
+            "attendee-review",
             4,
             stderr=str(exc),
         )
